@@ -76,7 +76,7 @@ def normalize_hs_code(raw: str) -> list[str]:
 def extract_hs_from_invoice_file(uploaded_file):
     """
     Reads workbook from uploaded Streamlit file.
-    Extracts HS codes from INVOICE!B20:B(before SUM).
+    Extracts HS codes from INVOICE!C20:C(before SUM).
     Returns list of dict rows.
     """
     uploaded_file.seek(0)
