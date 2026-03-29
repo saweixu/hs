@@ -9,10 +9,15 @@ import requests
 import streamlit as st
 from openpyxl import load_workbook
 from openpyxl.cell.cell import MergedCell
+from requests import Session
+from zeep import Client
+from zeep.helpers import serialize_object
+from zeep.transports import Transport
 
 # =========================================================
 # CONFIG
 # =========================================================
+WSDL_URL = "https://ec.europa.eu/taxation_customs/dds2/taric/services/goods?wsdl"
 DEFAULT_COUNTRY = "CN"
 TODAY_ISO = date.today().isoformat()
 
@@ -20,35 +25,16 @@ st.set_page_config(page_title="HS Code Analyzer", layout="wide")
 st.title("HS Code Analyzer from Invoices")
 st.caption(
     "Upload multiple invoice files, extract HS codes from INVOICE column C, "
-    "remove duplicates, analyze them through a JSON API, and export OUTPUT.xlsx"
+    "remove duplicates, analyze them against TARIC, and export OUTPUT.xlsx"
 )
-
-# =========================================================
-# SIDEBAR - API CONFIG
-# =========================================================
-with st.sidebar:
-    st.header("API Settings")
-
-    default_base_url = st.secrets.get("TARIC_SUPPORT_BASE_URL", "https://api.taricsupport.com")
-    default_token = st.secrets.get("TARIC_SUPPORT_TOKEN", "")
-    default_endpoint = st.secrets.get("TARIC_SUPPORT_MEASURES_ENDPOINT", "")
-
-    base_url = st.text_input("Base URL", value=default_base_url)
-    api_token = st.text_input("API Token", value=default_token, type="password")
-    measures_endpoint = st.text_input(
-        "Measures endpoint path",
-        value=default_endpoint,
-        help="Example: /v2/xxxxx  ← copy the exact path from Taric Support Swagger"
-    )
-
-    st.markdown(
-        "Use the exact endpoint path shown in Taric Support Swagger for the tariff/measures lookup."
-    )
 
 # =========================================================
 # HELPERS - EXCEL
 # =========================================================
 def find_sum_row(ws, search_col=2):
+    """
+    Find row where column B contains SUM.
+    """
     for r in range(1, ws.max_row + 1):
         v = ws.cell(r, search_col).value
         if v is None:
@@ -60,6 +46,9 @@ def find_sum_row(ws, search_col=2):
 
 
 def get_merged_cell_value(ws, row, col):
+    """
+    Return cell value, including merged-cell master value.
+    """
     cell = ws.cell(row=row, column=col)
 
     if not isinstance(cell, MergedCell):
@@ -73,13 +62,26 @@ def get_merged_cell_value(ws, row, col):
 
 
 def get_best_cell_value(ws_data, ws_formula, row, col):
+    """
+    Prefer calculated value, fallback to raw formula/text.
+    """
     v_data = get_merged_cell_value(ws_data, row, col)
     if v_data not in (None, ""):
         return v_data
-    return get_merged_cell_value(ws_formula, row, col)
+
+    v_formula = get_merged_cell_value(ws_formula, row, col)
+    return v_formula
 
 
 def normalize_hs_code(raw):
+    """
+    Extract possible HS/TARIC codes from a cell.
+    Accepts formats like:
+    - 9403700000
+    - 9403.70.00
+    - 9403 70 0000
+    - HS: 9403700000
+    """
     if raw is None:
         return []
 
@@ -100,6 +102,10 @@ def normalize_hs_code(raw):
 
 
 def extract_hs_from_invoice_file(uploaded_file):
+    """
+    Extract HS codes from INVOICE!C20:C(before SUM).
+    SUM is searched in column B.
+    """
     uploaded_file.seek(0)
     file_bytes = uploaded_file.read()
 
@@ -126,7 +132,8 @@ def extract_hs_from_invoice_file(uploaded_file):
     debug_rows = []
 
     for row in range(20, sum_row):
-        cell_value = get_best_cell_value(ws_data, ws_formula, row, 3)  # column C
+        # HS code in column C = 3
+        cell_value = get_best_cell_value(ws_data, ws_formula, row, 3)
 
         debug_rows.append({
             "file_name": uploaded_file.name,
@@ -150,26 +157,43 @@ def extract_hs_from_invoice_file(uploaded_file):
 
 
 # =========================================================
-# HELPERS - API JSON
+# HELPERS - TARIC
 # =========================================================
-def build_full_url(base_url: str, endpoint_path: str) -> str:
-    return base_url.rstrip("/") + "/" + endpoint_path.lstrip("/")
-
-
-def get_api_headers(token: str) -> dict:
-    return {
-        "Authorization": f"Bearer {token}",
-        "Accept": "application/json",
-        "Content-Type": "application/json",
+def get_taric_client():
+    """
+    Create TARIC SOAP client safely.
+    Raises readable exception instead of crashing the app.
+    """
+    session = Session()
+    session.headers.update({
         "User-Agent": "Mozilla/5.0",
-    }
+        "Accept": "text/xml, application/xml, */*"
+    })
 
-
-def safe_json(value):
+    # Step 1: direct WSDL availability test
     try:
-        return json.dumps(value, ensure_ascii=False, indent=2)
+        response = session.get(WSDL_URL, timeout=30)
+        response.raise_for_status()
+    except requests.exceptions.RequestException as e:
+        raise Exception(f"Cannot access TARIC WSDL URL: {e}")
+
+    # Step 2: SOAP client creation
+    try:
+        transport = Transport(session=session, timeout=30)
+        client = Client(wsdl=WSDL_URL, transport=transport)
+        return client
+    except Exception as e:
+        raise Exception(f"SOAP client creation failed: {e}")
+
+
+def safe_serialize(obj):
+    try:
+        return serialize_object(obj)
     except Exception:
-        return str(value)
+        try:
+            return json.loads(json.dumps(obj, default=str))
+        except Exception:
+            return str(obj)
 
 
 def flatten_strings(obj, found=None):
@@ -200,186 +224,120 @@ def shorten_text(text, max_len=3000):
     return text[:max_len] + " ..."
 
 
-def extract_description_from_json(data):
-    """
-    Best-effort extraction.
-    """
-    candidate_keys = [
-        "description", "goodsDescription", "goods_description",
-        "productDescription", "tariffDescription", "descriptionEn"
-    ]
-
-    if isinstance(data, dict):
-        for key in candidate_keys:
-            if key in data and data[key]:
-                return str(data[key])
-
-        for value in data.values():
-            desc = extract_description_from_json(value)
-            if desc:
-                return desc
-
-    elif isinstance(data, list):
-        for item in data:
-            desc = extract_description_from_json(item)
-            if desc:
-                return desc
-
-    return ""
-
-
-def extract_duty_from_json(data):
-    """
-    Best-effort extraction of duty/rate related values.
-    """
-    lines = []
+def summarize_measures(serialized_response):
+    leaves = flatten_strings(serialized_response, [])
+    clean = []
     seen = set()
+
     keywords = (
-        "duty", "rate", "third country", "erga omnes",
-        "customs", "%", "ad valorem"
+        "duty", "third country duty", "erga omnes", "import",
+        "measure", "certificate", "licence", "restriction",
+        "prohibition", "anti-dumping", "tariff", "suspension",
+        "quota", "additional code", "vat", "excise", "%"
     )
 
-    for item in flatten_strings(data, []):
-        text = " ".join(item.split())
-        low = text.lower()
+    for item in leaves:
+        line = " ".join(item.split())
+        low = line.lower()
+        if len(line) < 2:
+            continue
         if any(k in low for k in keywords):
-            if text not in seen:
-                seen.add(text)
-                lines.append(text)
+            if line not in seen:
+                seen.add(line)
+                clean.append(line)
 
-    return " | ".join(lines[:15])
+    if not clean:
+        fallback = []
+        for item in leaves:
+            line = " ".join(item.split())
+            if len(line) >= 3 and line not in fallback:
+                fallback.append(line)
+            if len(fallback) >= 15:
+                break
+        return " | ".join(fallback[:15])
 
-
-def extract_restrictions_from_json(data):
-    lines = []
-    seen = set()
-    keywords = (
-        "restriction", "prohibition", "certificate", "license", "licence",
-        "document", "quota", "anti-dumping", "measure", "additional code"
-    )
-
-    for item in flatten_strings(data, []):
-        text = " ".join(item.split())
-        low = text.lower()
-        if any(k in low for k in keywords):
-            if text not in seen:
-                seen.add(text)
-                lines.append(text)
-
-    return " | ".join(lines[:20])
+    return " | ".join(clean[:20])
 
 
-def analyze_hs_code_via_json_api(
-    hs_code: str,
-    country_code: str,
-    reference_date: str,
-    base_url: str,
-    endpoint_path: str,
-    token: str,
-):
+def taric_call_with_fallbacks(client, hs_code, country_code, reference_date):
     """
-    Generic JSON POST request.
-    You may need to adjust the payload keys to match the exact Taric Support endpoint.
+    Try several tradeMovement variants.
     """
-    if not token.strip():
-        return {
-            "hs_code": hs_code,
-            "country_code": country_code,
-            "reference_date": reference_date,
-            "description_en": "",
-            "duty_rate": "",
-            "restrictions_documents": "",
-            "status": "ERROR",
-            "error": "Missing API token.",
-            "raw_response": "",
-        }
+    last_error = None
+    variants = ["I", "IMPORT", "1", None]
 
-    if not endpoint_path.strip():
-        return {
-            "hs_code": hs_code,
-            "country_code": country_code,
-            "reference_date": reference_date,
-            "description_en": "",
-            "duty_rate": "",
-            "restrictions_documents": "",
-            "status": "ERROR",
-            "error": "Missing endpoint path. Paste the exact measures endpoint from Swagger.",
-            "raw_response": "",
-        }
-
-    url = build_full_url(base_url, endpoint_path)
-    headers = get_api_headers(token)
-
-    # Payload générique.
-    # Si la doc réelle utilise d'autres noms de champs, il faudra juste adapter ici.
-    payload = {
-        "goodsCode": hs_code,
-        "countryCode": country_code,
-        "referenceDate": reference_date,
-        "tradeMovement": "IMPORT",
-        "languageCode": "EN",
-    }
-
-    try:
-        response = requests.post(url, headers=headers, json=payload, timeout=45)
-        raw_text = response.text
-
-        if response.status_code >= 400:
-            return {
-                "hs_code": hs_code,
-                "country_code": country_code,
-                "reference_date": reference_date,
-                "description_en": "",
-                "duty_rate": "",
-                "restrictions_documents": "",
-                "status": "ERROR",
-                "error": f"HTTP {response.status_code}: {raw_text[:500]}",
-                "raw_response": raw_text[:12000],
-            }
-
+    for tm in variants:
         try:
-            data = response.json()
-        except Exception:
-            return {
-                "hs_code": hs_code,
-                "country_code": country_code,
-                "reference_date": reference_date,
-                "description_en": "",
-                "duty_rate": "",
-                "restrictions_documents": "",
-                "status": "ERROR",
-                "error": "API did not return valid JSON.",
-                "raw_response": raw_text[:12000],
+            kwargs = {
+                "goodsCode": hs_code,
+                "countryCode": country_code,
+                "referenceDate": reference_date,
             }
+            if tm is not None:
+                kwargs["tradeMovement"] = tm
 
-        description = shorten_text(extract_description_from_json(data), 1000)
-        duty_rate = shorten_text(extract_duty_from_json(data), 2000)
-        restrictions = shorten_text(extract_restrictions_from_json(data), 3000)
+            resp = client.service.goodsMeasForWs(**kwargs)
+            return resp, tm, None
+        except Exception as e:
+            last_error = str(e)
 
-        return {
-            "hs_code": hs_code,
-            "country_code": country_code,
-            "reference_date": reference_date,
-            "description_en": description,
-            "duty_rate": duty_rate,
-            "restrictions_documents": restrictions,
-            "status": "OK",
-            "error": "",
-            "raw_response": safe_json(data)[:12000],
-        }
+    return None, None, last_error
 
-    except requests.RequestException as e:
-        return {
-            "hs_code": hs_code,
-            "country_code": country_code,
-            "reference_date": reference_date,
-            "description_en": "",
-            "duty_rate": "",
-            "restrictions_documents": "",
-            "status": "ERROR",
-            "error": str(e),
-            "raw_response": "",
-        }
+
+def analyze_hs_code(client, hs_code, country_code=DEFAULT_COUNTRY, reference_date=TODAY_ISO):
+    description = ""
+    measures_summary = ""
+    raw_json = ""
+    used_trade_movement = ""
+    status = "OK"
+    error = ""
+
+    # Description
+    try:
+        d = client.service.goodsDescrForWs(
+            goodsCode=hs_code,
+            languageCode="EN",
+            referenceDate=reference_date,
+        )
+        d_ser = safe_serialize(d)
+        description = shorten_text(" | ".join(flatten_strings(d_ser, [])), 1000)
+    except Exception as e:
+        description = ""
+        error = f"Description error: {e}"
+
+    # Measures
+    resp, used_tm, meas_error = taric_call_with_fallbacks(
+        client=client,
+        hs_code=hs_code,
+        country_code=country_code,
+        reference_date=reference_date
+    )
+
+    used_trade_movement = "" if used_tm is None else str(used_tm)
+
+    if resp is not None:
+        ser = safe_serialize(resp)
+        measures_summary = shorten_text(summarize_measures(ser), 3000)
+        raw_json = shorten_text(json.dumps(ser, ensure_ascii=False, indent=2, default=str), 12000)
+    else:
+        status = "ERROR"
+        error = f"{error} | Measures error: {meas_error}".strip(" |")
+        raw_json = ""
+
+    if not error:
+        error = ""
+
+    return {
+        "hs_code": hs_code,
+        "country_code": country_code,
+        "reference_date": reference_date,
+        "trade_movement_used": used_trade_movement,
+        "description_en": description,
+        "measures_summary": measures_summary,
+        "status": status,
+        "error": error,
+        "raw_response": raw_json,
+    }
 
 
 # =========================================================
@@ -454,25 +412,59 @@ if uploaded_files:
 
     if st.button("Analyze HS Codes"):
         summary_rows = []
-        progress = st.progress(0)
-        total = len(unique_codes)
 
-        for i, hs in enumerate(unique_codes, start=1):
-            result = analyze_hs_code_via_json_api(
-                hs_code=hs,
-                country_code=DEFAULT_COUNTRY,
-                reference_date=TODAY_ISO,
-                base_url=base_url,
-                endpoint_path=measures_endpoint,
-                token=api_token,
-            )
+        with st.spinner("Connecting to TARIC and analyzing HS codes..."):
+            try:
+                client = get_taric_client()
+                taric_available = True
+                st.success("TARIC connection OK.")
+            except Exception as e:
+                taric_available = False
+                st.warning(f"TARIC not available. Output will still be generated. Error: {e}")
 
-            result["source_file_count"] = len(grouped_files[hs])
-            result["source_files"] = " | ".join(sorted(grouped_files[hs]))
-            result["source_positions"] = " | ".join(grouped_positions[hs])
+            progress = st.progress(0)
+            total = len(unique_codes)
 
-            summary_rows.append(result)
-            progress.progress(i / total)
+            for i, hs in enumerate(unique_codes, start=1):
+                if taric_available:
+                    try:
+                        result = analyze_hs_code(
+                            client=client,
+                            hs_code=hs,
+                            country_code=DEFAULT_COUNTRY,
+                            reference_date=TODAY_ISO
+                        )
+                    except Exception as e:
+                        result = {
+                            "hs_code": hs,
+                            "country_code": DEFAULT_COUNTRY,
+                            "reference_date": TODAY_ISO,
+                            "trade_movement_used": "",
+                            "description_en": "",
+                            "measures_summary": "",
+                            "status": "ERROR",
+                            "error": str(e),
+                            "raw_response": "",
+                        }
+                else:
+                    result = {
+                        "hs_code": hs,
+                        "country_code": DEFAULT_COUNTRY,
+                        "reference_date": TODAY_ISO,
+                        "trade_movement_used": "",
+                        "description_en": "",
+                        "measures_summary": "",
+                        "status": "TARIC_UNAVAILABLE",
+                        "error": "TARIC connection unavailable in current environment.",
+                        "raw_response": "",
+                    }
+
+                result["source_file_count"] = len(grouped_files[hs])
+                result["source_files"] = " | ".join(sorted(grouped_files[hs]))
+                result["source_positions"] = " | ".join(grouped_positions[hs])
+
+                summary_rows.append(result)
+                progress.progress(i / total)
 
         df_summary = pd.DataFrame(summary_rows)
 
