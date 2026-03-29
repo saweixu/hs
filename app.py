@@ -43,28 +43,15 @@ def find_sum_row(ws, search_col=2):
 
 
 def normalize_hs_code(raw: str) -> list[str]:
-    """
-    Extract possible HS/TARIC codes from text.
-    Keeps digit groups of length 6 to 10.
-    Returns unique normalized digit-only codes found in that cell.
-    """
     if raw is None:
         return []
 
     text = str(raw)
-
-    # Common patterns like:
-    # 39269097
-    # 3926.90.97
-    # HS 39269097
-    # code: 3926 90 97
     candidates = set()
 
-    # 1) direct digit groups of length 6-10
     for m in re.findall(r"(?<!\d)(\d{6,10})(?!\d)", text):
         candidates.add(m)
 
-    # 2) dotted/spaced groups that can combine to 6-10 digits
     for m in re.findall(r"(?<!\d)(\d{4}[.\s]?\d{2}(?:[.\s]?\d{2}){0,2})(?!\d)", text):
         digits = re.sub(r"\D", "", m)
         if 6 <= len(digits) <= 10:
@@ -73,17 +60,13 @@ def normalize_hs_code(raw: str) -> list[str]:
     return sorted(candidates)
 
 
+Tu peux remplacer ta fonction par celle-ci :
+
 def extract_hs_from_invoice_file(uploaded_file):
-    """
-    Reads workbook from uploaded Streamlit file.
-    Extracts HS codes from INVOICE!C20:C(before SUM).
-    Returns list of dict rows.
-    """
     uploaded_file.seek(0)
     wb = load_workbook(filename=io.BytesIO(uploaded_file.read()), data_only=True)
 
     if "INVOICE" not in wb.sheetnames:
-        # fallback: first sheet
         ws = wb[wb.sheetnames[0]]
         sheet_used = wb.sheetnames[0]
     else:
@@ -95,10 +78,13 @@ def extract_hs_from_invoice_file(uploaded_file):
         return [], f"{uploaded_file.name}: SUM row not found in sheet '{sheet_used}'"
 
     results = []
-    for row in range(20, sum_row):
-        cell_value = ws.cell(row=row, column=2).value  # column B
-        codes = normalize_hs_code(cell_value)
+    debug_rows = []
 
+    for row in range(20, sum_row):
+        cell_value = ws.cell(row=row, column=3).value   # <-- colonne C
+        debug_rows.append((row, cell_value))
+
+        codes = normalize_hs_code(cell_value)
         for code in codes:
             results.append({
                 "file_name": uploaded_file.name,
@@ -107,6 +93,12 @@ def extract_hs_from_invoice_file(uploaded_file):
                 "raw_cell_value": "" if cell_value is None else str(cell_value),
                 "hs_code": code,
             })
+
+    print(f"=== DEBUG {uploaded_file.name} ===")
+    print("SUM row =", sum_row)
+    for r, v in debug_rows:
+        print(f"C{r} = {v!r}")
+    print("Detected HS count =", len(results))
 
     return results, None
 
