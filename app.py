@@ -107,9 +107,23 @@ def extract_hs_from_invoice_file(uploaded_file):
 @st.cache_resource(show_spinner=False)
 def get_taric_client():
     session = Session()
-    session.verify = True
-    transport = Transport(session=session, timeout=60)
-    return Client(wsdl=WSDL_URL, transport=transport)
+
+    session.headers.update({
+        "User-Agent": "Mozilla/5.0",
+        "Accept": "text/xml"
+    })
+
+    transport = Transport(session=session, timeout=30)
+
+    try:
+        client = Client(
+            wsdl="https://ec.europa.eu/taxation_customs/dds2/taric/services/goods?wsdl",
+            transport=transport
+        )
+        return client
+
+    except Exception as e:
+        raise Exception(f"TARIC connection failed: {e}")
 
 
 def safe_serialize(obj):
