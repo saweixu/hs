@@ -60,8 +60,6 @@ def normalize_hs_code(raw: str) -> list[str]:
     return sorted(candidates)
 
 
-Tu peux remplacer ta fonction par celle-ci :
-
 def extract_hs_from_invoice_file(uploaded_file):
     uploaded_file.seek(0)
     wb = load_workbook(filename=io.BytesIO(uploaded_file.read()), data_only=True)
