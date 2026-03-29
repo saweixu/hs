@@ -5,12 +5,14 @@ from datetime import date
 from collections import defaultdict
 
 import pandas as pd
+import requests
 import streamlit as st
 from openpyxl import load_workbook
+from openpyxl.cell.cell import MergedCell
+from requests import Session
 from zeep import Client
 from zeep.helpers import serialize_object
 from zeep.transports import Transport
-from requests import Session
 
 # =========================================================
 # CONFIG
@@ -21,16 +23,17 @@ TODAY_ISO = date.today().isoformat()
 
 st.set_page_config(page_title="HS Code Analyzer", layout="wide")
 st.title("HS Code Analyzer from Invoices")
-st.caption("Upload multiple invoice files, extract HS codes from INVOICE column B, remove duplicates, analyze them against TARIC, and export OUTPUT.xlsx")
-
+st.caption(
+    "Upload multiple invoice files, extract HS codes from INVOICE column C, "
+    "remove duplicates, analyze them against TARIC, and export OUTPUT.xlsx"
+)
 
 # =========================================================
 # HELPERS - EXCEL
 # =========================================================
 def find_sum_row(ws, search_col=2):
     """
-    Find row where column B contains SUM (exact or with spaces/punctuation around).
-    Returns row index or None.
+    Find row where column B contains SUM.
     """
     for r in range(1, ws.max_row + 1):
         v = ws.cell(r, search_col).value
@@ -42,17 +45,55 @@ def find_sum_row(ws, search_col=2):
     return None
 
 
-def normalize_hs_code(raw: str) -> list[str]:
+def get_merged_cell_value(ws, row, col):
+    """
+    Return cell value, including merged-cell master value.
+    """
+    cell = ws.cell(row=row, column=col)
+
+    if not isinstance(cell, MergedCell):
+        return cell.value
+
+    for merged_range in ws.merged_cells.ranges:
+        if cell.coordinate in merged_range:
+            return ws.cell(merged_range.min_row, merged_range.min_col).value
+
+    return None
+
+
+def get_best_cell_value(ws_data, ws_formula, row, col):
+    """
+    Prefer calculated value, fallback to raw formula/text.
+    """
+    v_data = get_merged_cell_value(ws_data, row, col)
+    if v_data not in (None, ""):
+        return v_data
+
+    v_formula = get_merged_cell_value(ws_formula, row, col)
+    return v_formula
+
+
+def normalize_hs_code(raw):
+    """
+    Extract possible HS/TARIC codes from a cell.
+    Accepts formats like:
+    - 9403700000
+    - 9403.70.00
+    - 9403 70 0000
+    - HS: 9403700000
+    """
     if raw is None:
         return []
 
-    text = str(raw)
+    text = str(raw).strip()
     candidates = set()
 
+    # direct 6-10 digit blocks
     for m in re.findall(r"(?<!\d)(\d{6,10})(?!\d)", text):
         candidates.add(m)
 
-    for m in re.findall(r"(?<!\d)(\d{4}[.\s]?\d{2}(?:[.\s]?\d{2}){0,2})(?!\d)", text):
+    # dotted / spaced / slashed groups
+    for m in re.findall(r"(?<!\d)(\d{4}[.\s/-]?\d{2}(?:[.\s/-]?\d{2}){0,2})(?!\d)", text):
         digits = re.sub(r"\D", "", m)
         if 6 <= len(digits) <= 10:
             candidates.add(digits)
@@ -61,26 +102,46 @@ def normalize_hs_code(raw: str) -> list[str]:
 
 
 def extract_hs_from_invoice_file(uploaded_file):
+    """
+    Extract HS codes from INVOICE!C20:C(before SUM).
+    SUM is searched in column B.
+    """
     uploaded_file.seek(0)
-    wb = load_workbook(filename=io.BytesIO(uploaded_file.read()), data_only=True)
+    file_bytes = uploaded_file.read()
 
-    if "INVOICE" not in wb.sheetnames:
-        ws = wb[wb.sheetnames[0]]
-        sheet_used = wb.sheetnames[0]
-    else:
-        ws = wb["INVOICE"]
+    wb_data = load_workbook(io.BytesIO(file_bytes), data_only=True)
+    wb_formula = load_workbook(io.BytesIO(file_bytes), data_only=False)
+
+    if "INVOICE" in wb_data.sheetnames:
+        ws_data = wb_data["INVOICE"]
+        ws_formula = wb_formula["INVOICE"]
         sheet_used = "INVOICE"
+    else:
+        sheet_used = wb_data.sheetnames[0]
+        ws_data = wb_data[sheet_used]
+        ws_formula = wb_formula[sheet_used]
 
-    sum_row = find_sum_row(ws, search_col=2)
+    sum_row = find_sum_row(ws_data, search_col=2)
     if not sum_row:
-        return [], f"{uploaded_file.name}: SUM row not found in sheet '{sheet_used}'"
+        sum_row = find_sum_row(ws_formula, search_col=2)
+
+    if not sum_row:
+        return [], [], f"{uploaded_file.name}: SUM row not found in sheet '{sheet_used}'"
 
     results = []
     debug_rows = []
 
     for row in range(20, sum_row):
-        cell_value = ws.cell(row=row, column=3).value   # <-- colonne C
-        debug_rows.append((row, cell_value))
+        # HS code in column C = 3
+        cell_value = get_best_cell_value(ws_data, ws_formula, row, 3)
+
+        debug_rows.append({
+            "file_name": uploaded_file.name,
+            "sheet_name": sheet_used,
+            "row": row,
+            "cell": f"C{row}",
+            "raw_value": "" if cell_value is None else str(cell_value),
+        })
 
         codes = normalize_hs_code(cell_value)
         for code in codes:
@@ -92,38 +153,37 @@ def extract_hs_from_invoice_file(uploaded_file):
                 "hs_code": code,
             })
 
-    print(f"=== DEBUG {uploaded_file.name} ===")
-    print("SUM row =", sum_row)
-    for r, v in debug_rows:
-        print(f"C{r} = {v!r}")
-    print("Detected HS count =", len(results))
-
-    return results, None
+    return results, debug_rows, None
 
 
 # =========================================================
-# HELPERS - TARIC SOAP
+# HELPERS - TARIC
 # =========================================================
-@st.cache_resource(show_spinner=False)
 def get_taric_client():
+    """
+    Create TARIC SOAP client safely.
+    Raises readable exception instead of crashing the app.
+    """
     session = Session()
-
     session.headers.update({
         "User-Agent": "Mozilla/5.0",
-        "Accept": "text/xml"
+        "Accept": "text/xml, application/xml, */*"
     })
 
-    transport = Transport(session=session, timeout=30)
-
+    # Step 1: direct WSDL availability test
     try:
-        client = Client(
-            wsdl="https://ec.europa.eu/taxation_customs/dds2/taric/services/goods?wsdl",
-            transport=transport
-        )
-        return client
+        response = session.get(WSDL_URL, timeout=30)
+        response.raise_for_status()
+    except requests.exceptions.RequestException as e:
+        raise Exception(f"Cannot access TARIC WSDL URL: {e}")
 
+    # Step 2: SOAP client creation
+    try:
+        transport = Transport(session=session, timeout=30)
+        client = Client(wsdl=WSDL_URL, transport=transport)
+        return client
     except Exception as e:
-        raise Exception(f"TARIC connection failed: {e}")
+        raise Exception(f"SOAP client creation failed: {e}")
 
 
 def safe_serialize(obj):
@@ -137,10 +197,6 @@ def safe_serialize(obj):
 
 
 def flatten_strings(obj, found=None):
-    """
-    Recursively collect all string/number leaf values from nested response.
-    Useful because TARIC SOAP structure can be quite nested.
-    """
     if found is None:
         found = []
 
@@ -159,7 +215,7 @@ def flatten_strings(obj, found=None):
     return found
 
 
-def shorten_text(text, max_len=2000):
+def shorten_text(text, max_len=3000):
     if text is None:
         return ""
     text = str(text).strip()
@@ -169,10 +225,6 @@ def shorten_text(text, max_len=2000):
 
 
 def summarize_measures(serialized_response):
-    """
-    Best-effort summary from TARIC response.
-    Because the SOAP structure can vary, we flatten everything and keep useful lines.
-    """
     leaves = flatten_strings(serialized_response, [])
     clean = []
     seen = set()
@@ -195,7 +247,6 @@ def summarize_measures(serialized_response):
                 clean.append(line)
 
     if not clean:
-        # fallback: return first meaningful leaf values
         fallback = []
         for item in leaves:
             line = " ".join(item.split())
@@ -210,7 +261,7 @@ def summarize_measures(serialized_response):
 
 def taric_call_with_fallbacks(client, hs_code, country_code, reference_date):
     """
-    Try several tradeMovement variants because SOAP implementations can be strict.
+    Try several tradeMovement variants.
     """
     last_error = None
     variants = ["I", "IMPORT", "1", None]
@@ -234,10 +285,6 @@ def taric_call_with_fallbacks(client, hs_code, country_code, reference_date):
 
 
 def analyze_hs_code(client, hs_code, country_code=DEFAULT_COUNTRY, reference_date=TODAY_ISO):
-    """
-    Calls both description and measures.
-    Returns dict ready for output table.
-    """
     description = ""
     measures_summary = ""
     raw_json = ""
@@ -296,15 +343,16 @@ def analyze_hs_code(client, hs_code, country_code=DEFAULT_COUNTRY, reference_dat
 # =========================================================
 # OUTPUT EXCEL
 # =========================================================
-def build_output_excel(df_hs_found, df_summary):
-    buffer = io.BytesIO()
+def build_output_excel(df_hs_found, df_summary, df_debug):
+    output = io.BytesIO()
 
-    with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
         df_hs_found.to_excel(writer, index=False, sheet_name="HS_FOUND")
         df_summary.to_excel(writer, index=False, sheet_name="OUTPUT")
+        df_debug.to_excel(writer, index=False, sheet_name="DEBUG_READ")
 
-    buffer.seek(0)
-    return buffer
+    output.seek(0)
+    return output
 
 
 # =========================================================
@@ -320,13 +368,15 @@ if uploaded_files:
     st.info(f"{len(uploaded_files)} file(s) uploaded.")
 
     all_rows = []
+    all_debug_rows = []
     warnings = []
 
     for f in uploaded_files:
-        rows, err = extract_hs_from_invoice_file(f)
+        rows, debug_rows, err = extract_hs_from_invoice_file(f)
         if err:
             warnings.append(err)
         all_rows.extend(rows)
+        all_debug_rows.extend(debug_rows)
 
     if warnings:
         for w in warnings:
@@ -334,11 +384,14 @@ if uploaded_files:
 
     if not all_rows:
         st.error("No HS code found in uploaded files.")
+        if all_debug_rows:
+            with st.expander("Debug preview", expanded=True):
+                st.dataframe(pd.DataFrame(all_debug_rows), use_container_width=True)
         st.stop()
 
     df_found = pd.DataFrame(all_rows)
+    df_debug = pd.DataFrame(all_debug_rows)
 
-    # Unique HS codes across all uploaded invoices
     grouped_files = defaultdict(set)
     grouped_positions = defaultdict(list)
 
@@ -354,21 +407,57 @@ if uploaded_files:
     with st.expander("Preview extracted HS codes", expanded=False):
         st.dataframe(df_found, use_container_width=True)
 
+    with st.expander("Debug preview (read values from column C)", expanded=False):
+        st.dataframe(df_debug, use_container_width=True)
+
     if st.button("Analyze HS Codes"):
+        summary_rows = []
+
         with st.spinner("Connecting to TARIC and analyzing HS codes..."):
-            client = get_taric_client()
-            summary_rows = []
+            try:
+                client = get_taric_client()
+                taric_available = True
+                st.success("TARIC connection OK.")
+            except Exception as e:
+                taric_available = False
+                st.warning(f"TARIC not available. Output will still be generated. Error: {e}")
 
             progress = st.progress(0)
             total = len(unique_codes)
 
             for i, hs in enumerate(unique_codes, start=1):
-                result = analyze_hs_code(
-                    client=client,
-                    hs_code=hs,
-                    country_code=DEFAULT_COUNTRY,
-                    reference_date=TODAY_ISO
-                )
+                if taric_available:
+                    try:
+                        result = analyze_hs_code(
+                            client=client,
+                            hs_code=hs,
+                            country_code=DEFAULT_COUNTRY,
+                            reference_date=TODAY_ISO
+                        )
+                    except Exception as e:
+                        result = {
+                            "hs_code": hs,
+                            "country_code": DEFAULT_COUNTRY,
+                            "reference_date": TODAY_ISO,
+                            "trade_movement_used": "",
+                            "description_en": "",
+                            "measures_summary": "",
+                            "status": "ERROR",
+                            "error": str(e),
+                            "raw_response": "",
+                        }
+                else:
+                    result = {
+                        "hs_code": hs,
+                        "country_code": DEFAULT_COUNTRY,
+                        "reference_date": TODAY_ISO,
+                        "trade_movement_used": "",
+                        "description_en": "",
+                        "measures_summary": "",
+                        "status": "TARIC_UNAVAILABLE",
+                        "error": "TARIC connection unavailable in current environment.",
+                        "raw_response": "",
+                    }
 
                 result["source_file_count"] = len(grouped_files[hs])
                 result["source_files"] = " | ".join(sorted(grouped_files[hs]))
@@ -377,12 +466,12 @@ if uploaded_files:
                 summary_rows.append(result)
                 progress.progress(i / total)
 
-            df_summary = pd.DataFrame(summary_rows)
+        df_summary = pd.DataFrame(summary_rows)
 
         st.subheader("Analysis Result")
         st.dataframe(df_summary, use_container_width=True)
 
-        xlsx_data = build_output_excel(df_found, df_summary)
+        xlsx_data = build_output_excel(df_found, df_summary, df_debug)
 
         st.download_button(
             label="Download OUTPUT.xlsx",
@@ -390,5 +479,6 @@ if uploaded_files:
             file_name="OUTPUT.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
+
 else:
     st.info("Upload one or more invoice files to begin.")
