@@ -6,6 +6,8 @@ import pandas as pd
 import streamlit as st
 from openpyxl import load_workbook
 from openpyxl.cell.cell import MergedCell
+from openpyxl.styles import Font, PatternFill
+from openpyxl.utils import get_column_letter
 
 # =========================================================
 # CONFIG
@@ -59,12 +61,6 @@ ALLOWED_EXTENSIONS = [".xlsx", ".xlsm", ".xltx", ".xltm"]
 # HELPERS
 # =========================================================
 def normalize_hs(value):
-    """
-    Normalize HS code:
-    - convert to string
-    - remove spaces, dots, commas, dashes, slashes
-    - keep only digits
-    """
     if value is None:
         return ""
 
@@ -78,18 +74,12 @@ def normalize_hs(value):
 
 
 def clean_text(value):
-    """
-    Return clean text for display/export.
-    """
     if value is None:
         return ""
     return str(value).replace("\n", " ").strip()
 
 
 def get_merged_value(ws, row, col):
-    """
-    Return the visible value of a merged cell if needed.
-    """
     cell = ws.cell(row=row, column=col)
 
     if not isinstance(cell, MergedCell):
@@ -106,9 +96,6 @@ def get_merged_value(ws, row, col):
 
 
 def find_sum_row(ws, search_col=2):
-    """
-    Find the row where column B contains SUM / SUM: / similar.
-    """
     for r in range(1, ws.max_row + 1):
         val = get_merged_value(ws, r, search_col)
         if val is None:
@@ -119,13 +106,58 @@ def find_sum_row(ws, search_col=2):
     return None
 
 
+def autofit_worksheet(ws):
+    for col_cells in ws.columns:
+        max_length = 0
+        col_idx = col_cells[0].column
+        col_letter = get_column_letter(col_idx)
+
+        for cell in col_cells:
+            try:
+                value = "" if cell.value is None else str(cell.value)
+                if len(value) > max_length:
+                    max_length = len(value)
+            except Exception:
+                pass
+
+        ws.column_dimensions[col_letter].width = min(max(max_length + 2, 12), 60)
+
+
+def style_worksheet(ws):
+    header_fill = PatternFill(fill_type="solid", fgColor="D9EAF7")
+    header_font = Font(bold=True)
+
+    for cell in ws[1]:
+        cell.fill = header_fill
+        cell.font = header_font
+
+    ws.freeze_panes = "A2"
+
+    if ws.max_row >= 1 and ws.max_column >= 1:
+        ws.auto_filter.ref = ws.dimensions
+
+    autofit_worksheet(ws)
+
+
+def build_excel_report(summary_df, issues_df):
+    output = io.BytesIO()
+
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        summary_df.to_excel(writer, sheet_name="Summary", index=False)
+        issues_df.to_excel(writer, sheet_name="Issues", index=False)
+
+        wb = writer.book
+        ws_summary = wb["Summary"]
+        ws_issues = wb["Issues"]
+
+        style_worksheet(ws_summary)
+        style_worksheet(ws_issues)
+
+    output.seek(0)
+    return output
+
+
 def analyze_file(uploaded_file):
-    """
-    Analyze one uploaded Excel file.
-    Returns:
-      issues: list of dict
-      summary: dict
-    """
     issues = []
 
     filename = uploaded_file.name
@@ -184,14 +216,12 @@ def analyze_file(uploaded_file):
             "issue_count": 0,
         }
 
-    # invoice number often stored in C5
     invoice_no = clean_text(get_merged_value(ws, 5, 3))
-
     checked_rows = 0
 
     for row in range(start_row, end_row + 1):
-        raw_desc = get_merged_value(ws, row, 2)  # column B
-        raw_hs = get_merged_value(ws, row, 3)    # column C
+        raw_desc = get_merged_value(ws, row, 2)  # B
+        raw_hs = get_merged_value(ws, row, 3)    # C
 
         description = clean_text(raw_desc)
         hs = normalize_hs(raw_hs)
@@ -219,7 +249,7 @@ def analyze_file(uploaded_file):
                     "Description": description,
                     "HS Code": hs,
                     "Reason": " | ".join(reasons),
-                    "Location": f"{filename} | INVOICE | C{row} | {description}",
+                    "Location": f"{filename} | Invoice {invoice_no} | INVOICE | C{row} | {description}",
                 }
             )
 
@@ -234,18 +264,6 @@ def analyze_file(uploaded_file):
         "checked_rows": checked_rows,
         "issue_count": len(issues),
     }
-
-
-def build_excel_report(summary_df, issues_df):
-    """
-    Create an Excel report in memory.
-    """
-    output = io.BytesIO()
-    with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        summary_df.to_excel(writer, sheet_name="Summary", index=False)
-        issues_df.to_excel(writer, sheet_name="Issues", index=False)
-    output.seek(0)
-    return output
 
 
 # =========================================================
