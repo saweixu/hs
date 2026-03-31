@@ -27,7 +27,7 @@ st.title("HS Code Checker CG")
 st.caption(
     "Upload one or more invoice files. "
     "The app checks HS codes in INVOICE!C20:C(SUM-1) and flags "
-    "codes starting with 87, or codes found in the watch list."
+    "codes starting with 8714, or codes found in the watch list."
 )
 
 WATCHLIST = {
@@ -232,8 +232,8 @@ def analyze_file(uploaded_file):
         checked_rows += 1
         reasons = []
 
-        if hs[:2] == "87":
-            reasons.append("HS starts with 87")
+        if hs[:2] == "8714":
+            reasons.append("HS starts with 8714")
 
         if hs in WATCHLIST:
             reasons.append("HS found in watch list")
