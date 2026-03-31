@@ -20,12 +20,12 @@ st.sidebar.image("logo.png", width=200)
 st.sidebar.markdown("### Athina Logistics")
 st.sidebar.caption("Global Access")
 
-st.set_page_config(page_title="HS Code Checker CG", layout="wide")
-st.title("HS Code Checker CG")
+st.set_page_config(page_title="HS Code Checker", layout="wide")
+st.title("HS Code Checker")
 st.caption(
     "Upload one or more invoice files. "
-    "The app checks HS codes and flags:"
-    " codes starting with 87, or codes found in the watch list."
+    "The app checks HS codes in INVOICE!C20:C(SUM-1) and flags "
+    "codes starting with 87, or codes found in the watch list."
 )
 
 WATCHLIST = {
@@ -73,8 +73,17 @@ def normalize_hs(value):
         return ""
 
     s = s.replace("\n", " ").strip()
-    s = re.sub(r"[^\d]", "", s)  # keep digits only
+    s = re.sub(r"[^\d]", "", s)
     return s
+
+
+def clean_text(value):
+    """
+    Return clean text for display/export.
+    """
+    if value is None:
+        return ""
+    return str(value).replace("\n", " ").strip()
 
 
 def get_merged_value(ws, row, col):
@@ -175,10 +184,16 @@ def analyze_file(uploaded_file):
             "issue_count": 0,
         }
 
+    # invoice number often stored in C5
+    invoice_no = clean_text(get_merged_value(ws, 5, 3))
+
     checked_rows = 0
 
     for row in range(start_row, end_row + 1):
-        raw_hs = get_merged_value(ws, row, 3)  # column C
+        raw_desc = get_merged_value(ws, row, 2)  # column B
+        raw_hs = get_merged_value(ws, row, 3)    # column C
+
+        description = clean_text(raw_desc)
         hs = normalize_hs(raw_hs)
 
         if not hs:
@@ -197,11 +212,14 @@ def analyze_file(uploaded_file):
             issues.append(
                 {
                     "File": filename,
+                    "Invoice No": invoice_no,
                     "Sheet": "INVOICE",
                     "Row": row,
                     "Cell": f"C{row}",
+                    "Description": description,
                     "HS Code": hs,
                     "Reason": " | ".join(reasons),
+                    "Location": f"{filename} | INVOICE | C{row} | {description}",
                 }
             )
 
@@ -210,6 +228,7 @@ def analyze_file(uploaded_file):
 
     return issues, {
         "file": filename,
+        "invoice_no": invoice_no,
         "status": status,
         "message": message,
         "checked_rows": checked_rows,
@@ -277,10 +296,24 @@ if run_btn:
     issues_df = pd.DataFrame(all_issues)
 
     if summary_df.empty:
-        summary_df = pd.DataFrame(columns=["file", "status", "message", "checked_rows", "issue_count"])
+        summary_df = pd.DataFrame(
+            columns=["file", "invoice_no", "status", "message", "checked_rows", "issue_count"]
+        )
 
     if issues_df.empty:
-        issues_df = pd.DataFrame(columns=["File", "Sheet", "Row", "Cell", "HS Code", "Reason"])
+        issues_df = pd.DataFrame(
+            columns=[
+                "File",
+                "Invoice No",
+                "Sheet",
+                "Row",
+                "Cell",
+                "Description",
+                "HS Code",
+                "Reason",
+                "Location",
+            ]
+        )
 
     st.markdown("## Summary")
     st.dataframe(summary_df, use_container_width=True, hide_index=True)
