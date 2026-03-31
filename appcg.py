@@ -22,8 +22,8 @@ st.sidebar.image("logo.png", width=200)
 st.sidebar.markdown("### Athina Logistics")
 st.sidebar.caption("Global Access")
 
-st.set_page_config(page_title="HS Code Checker", layout="wide")
-st.title("HS Code Checker")
+st.set_page_config(page_title="HS Code Checker CG", layout="wide")
+st.title("HS Code Checker CG")
 st.caption(
     "Upload one or more invoice files. "
     "The app checks HS codes in INVOICE!C20:C(SUM-1) and flags "
