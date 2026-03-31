@@ -10,11 +10,11 @@ from openpyxl.cell.cell import MergedCell
 # =========================================================
 # CONFIG
 # =========================================================
-st.set_page_config(page_title="HS Code Checker", layout="wide")
+st.set_page_config(page_title="HS Code Checker CG", layout="wide")
 st.title("HS Code Checker")
 st.caption(
     "Upload one or more invoice files. "
-    "The app checks HS codes in INVOICE!C20:C(SUM-1) and flags:"
+    "The app checks HS codes and flags:"
     " codes starting with 87, or codes found in the watch list."
 )
 
